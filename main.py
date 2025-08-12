@@ -10,11 +10,12 @@ import json
 
 from google.oauth2.service_account import Credentials
 import gspread
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -27,7 +28,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "FLEX")
-AUTHORIZED_USERS_FILE = "authorized_users.txt"
 PHOTO_ROOT = Path("/tmp/flex_photos")
 
 # ============================
@@ -48,7 +48,7 @@ containers_ws = ss.sheet1
 # ============================
 # STATE
 # ============================
-user_state = {}  # uid: {"row": int, "booking": str}
+user_state = {}  # uid: {"row": int, "step": str, "booking": str}
 
 # ============================
 # OCR GPT
@@ -96,55 +96,64 @@ def update_sheet_cell(row: int, col: int, value: str):
 # ============================
 # TELEGRAM BOT
 # ============================
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("Букинг"), KeyboardButton("Сканирование фото")],
-        [KeyboardButton("Балки"), KeyboardButton("Допы"), KeyboardButton("Листы")]
-    ], resize_keyboard=True)
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Добро пожаловать. Выберите действие:", reply_markup=main_keyboard())
+    keyboard = [
+        [InlineKeyboardButton("Начать ввод данных", callback_data="start_entry")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Добро пожаловать! Нажмите кнопку ниже, чтобы начать.", reply_markup=reply_markup)
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    user_state[uid] = {"step": "booking"}
+    await query.edit_message_text("Введите номер букинга:")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     uname = update.effective_user.username or "Без ника"
     text = update.message.text.strip()
+    state = user_state.get(uid, {})
+    step = state.get("step")
 
-    mode = context.user_data.get('mode')
-
-    if text in ["Букинг", "Балки", "Допы", "Листы", "Сканирование фото"]:
-        context.user_data['mode'] = text.lower()
-        await update.message.reply_text(f"Введите значение для: {text}")
-        return
-
-    if mode == 'букинг':
+    if step == "booking":
         booking = text
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         row_data = [now, '', '', '', booking]
         containers_ws.append_row(row_data)
         row = containers_ws.row_count
-        user_state[uid] = {"row": row, "booking": booking}
-        update_sheet_cell(row, 18, uname)  # Столбец R (18)
-        await update.message.reply_text("✅ Букинг добавлен.")
-    elif uid in user_state:
-        row = user_state[uid]['row']
-        if mode == 'балки' and text.isdigit():
-            update_sheet_cell(row, 14, text)  # N
-        elif mode == 'допы' and text.isdigit():
-            update_sheet_cell(row, 15, text)  # O
-        elif mode == 'листы' and text.isdigit():
-            update_sheet_cell(row, 16, text)  # P
-            await update.message.reply_text("✅ Данные сохранены.")
+        update_sheet_cell(row, 18, uname)  # R
+        user_state[uid] = {"row": row, "booking": booking, "step": "photo"}
+        await update.message.reply_text("📌 Букинг сохранён. Теперь загрузите фото контейнера и флекса.")
+    elif step == "beams":
+        if text.isdigit():
+            update_sheet_cell(user_state[uid]["row"], 14, text)  # N
+            user_state[uid]["step"] = "addons"
+            await update.message.reply_text("📌 Сколько дополнительных? Введите число:")
+        else:
+            await update.message.reply_text("⚠ Нужно ввести число.")
+    elif step == "addons":
+        if text.isdigit():
+            update_sheet_cell(user_state[uid]["row"], 15, text)  # O
+            user_state[uid]["step"] = "sheets"
+            await update.message.reply_text("📌 Сколько листов? Введите число:")
+        else:
+            await update.message.reply_text("⚠ Нужно ввести число.")
+    elif step == "sheets":
+        if text.isdigit():
+            update_sheet_cell(user_state[uid]["row"], 16, text)  # P
+            await update.message.reply_text("✅ Все данные сохранены.")
+            del user_state[uid]  # сброс состояния
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
     else:
-        await update.message.reply_text("Сначала введите букинг.")
+        await update.message.reply_text("Нажмите /start для начала.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    uname = update.effective_user.username or "Без ника"
-    if uid not in user_state:
-        await update.message.reply_text("Сначала введите букинг.")
+    if uid not in user_state or user_state[uid].get("step") != "photo":
+        await update.message.reply_text("Сначала нажмите /start и введите букинг.")
         return
 
     photo = update.message.photo[-1]
@@ -167,11 +176,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_sheet_cell(row, 11, flex_number)      # K
         update_sheet_cell(row, 13, f_url)            # M
 
-    await update.message.reply_text("📸 Фото обработано.")
+    user_state[uid]["step"] = "beams"
+    await update.message.reply_text("📸 Фото обработано. Сколько балок?")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     logging.info("✅ Бот запущен")
