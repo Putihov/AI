@@ -28,7 +28,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "FLEX")
-PHOTO_ROOT = Path("/tmp/flex_photos")
+PHOTO_ROOT = Path("/tmp/flex_photos")  # не используется при отключённом сохранении
 
 # ============================
 # CONFIG
@@ -48,60 +48,79 @@ containers_ws = ss.sheet1
 # ============================
 # STATE
 # ============================
-user_state = {}  # uid: {"row": int, "step": str, "booking": str}
+# step: booking -> photo -> beams -> addons -> sheets
+user_state: dict[int, dict] = {}
 
 # ============================
-# OCR GPT
+# OCR GPT (логика распознавания НЕ меняем)
 # ============================
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-PROMPT_CONTAINER = "На фото контейнер или документ. Верни ТОЛЬКО номер контейнера ISO 6346."
-PROMPT_FLEX = "На фото этикетка флекси-танка. Верни ТОЛЬКО номер вида B3G########X-26Q."
+PROMPT_CONTAINER = (
+    "На фото контейнер или документ. Тебе нужно вернуть ТОЛЬКО номер контейнера "
+    "в формате ISO 6346: 4 буквы и 7 цифр (пример: MSKU1234567). "
+    "Если номера нет или он нечитаем, верни строго слово: НЕ УДАЛОСЬ."
+)
+PROMPT_FLEX = (
+    "На фото этикетка флекси-танка. Номер ВСЕГДА начинается с B3G. Верни ТОЛЬКО серийный номер в формате: "
+    "B3G########X-25Q или B3G########X-26Q (пример: B3G24071283B-26Q). "
+    "Если номера нет или он нечитаем, верни строго: НЕ УДАЛОСЬ."
+)
 
 def ocr_gpt_base64(img_b64: str, mode: str) -> str:
     prompt = PROMPT_CONTAINER if mode == "container" else PROMPT_FLEX
     payload = {
         "model": "gpt-4o",
         "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                ],
+            }
         ],
-        "max_tokens": 50
+        "max_tokens": 50,
     }
     try:
         r = requests.post(OPENAI_URL, headers=HEADERS, json=payload, timeout=60)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip().upper()
-    except Exception:
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip().upper()
+    except Exception as e:
+        logging.exception("OpenAI request failed: %s", e)
         return "НЕ УДАЛОСЬ"
 
 # ============================
 # HELPERS
 # ============================
-def save_photo(photo_bytes: bytes, folder: Path, filename: str) -> str:
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / filename
-    with open(path, "wb") as f:
-        f.write(photo_bytes)
-    return str(path)
+# Сохранение фото на диск временно ОТКЛЮЧЕНО по требованию.
+# Оставляем заглушки, чтобы код не падал и было проще вернуть функционал.
+# def save_photo(photo_bytes: bytes, folder: Path, filename: str) -> str:
+#     folder.mkdir(parents=True, exist_ok=True)
+#     path = folder / filename
+#     with open(path, "wb") as f:
+#         f.write(photo_bytes)
+#     return str(path)
 
-def file_url(path: Path) -> str:
-    return f"file:///{str(path).replace('\\', '/')}"
+# def file_url(path: Path) -> str:
+#     return f"file:///{str(path).replace('\\\', '/')}"
 
 def update_sheet_cell(row: int, col: int, value: str):
-    containers_ws.update_cell(row, col, value)
+    try:
+        containers_ws.update_cell(row, col, value)
+    except Exception as e:
+        logging.exception("Google Sheets update failed (row=%s col=%s): %s", row, col, e)
 
 # ============================
 # TELEGRAM BOT
 # ============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Начать ввод данных", callback_data="start_entry")]
-    ]
+    keyboard = [[InlineKeyboardButton("Начать ввод данных", callback_data="start_entry")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Добро пожаловать! Нажмите кнопку ниже, чтобы начать.", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "Добро пожаловать! Нажмите кнопку ниже, чтобы начать.", reply_markup=reply_markup
+    )
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -113,71 +132,80 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     uname = update.effective_user.username or "Без ника"
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     state = user_state.get(uid, {})
     step = state.get("step")
 
     if step == "booking":
         booking = text
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        row_data = [now, '', '', '', booking]
-        containers_ws.append_row(row_data)
+        # создаём строку и запоминаем её индекс
+        containers_ws.append_row([now, '', '', '', booking])  # E — букинг
         row = containers_ws.row_count
-        update_sheet_cell(row, 18, uname)  # R
+        update_sheet_cell(row, 18, uname)  # R — username
         user_state[uid] = {"row": row, "booking": booking, "step": "photo"}
         await update.message.reply_text("📌 Букинг сохранён. Теперь загрузите фото контейнера и флекса.")
-    elif step == "beams":
+        return
+
+    if step == "beams":
         if text.isdigit():
-            update_sheet_cell(user_state[uid]["row"], 14, text)  # N
+            update_sheet_cell(state["row"], 14, text)  # N — Балки
             user_state[uid]["step"] = "addons"
             await update.message.reply_text("📌 Сколько дополнительных? Введите число:")
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
-    elif step == "addons":
+        return
+
+    if step == "addons":
         if text.isdigit():
-            update_sheet_cell(user_state[uid]["row"], 15, text)  # O
+            update_sheet_cell(state["row"], 15, text)  # O — Допы
             user_state[uid]["step"] = "sheets"
             await update.message.reply_text("📌 Сколько листов? Введите число:")
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
-    elif step == "sheets":
+        return
+
+    if step == "sheets":
         if text.isdigit():
-            update_sheet_cell(user_state[uid]["row"], 16, text)  # P
+            update_sheet_cell(state["row"], 16, text)  # P — Листы
             await update.message.reply_text("✅ Все данные сохранены.")
-            del user_state[uid]  # сброс состояния
+            user_state.pop(uid, None)  # сброс состояния
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
-    else:
-        await update.message.reply_text("Нажмите /start для начала.")
+        return
+
+    await update.message.reply_text("Нажмите /start и следуйте инструкциям.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in user_state or user_state[uid].get("step") != "photo":
+    state = user_state.get(uid)
+    if not state or state.get("step") != "photo":
         await update.message.reply_text("Сначала нажмите /start и введите букинг.")
         return
 
+    # берём фото максимального качества из массива
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     bytes_data = await file.download_as_bytearray()
     img_b64 = base64.b64encode(bytes_data).decode("utf-8")
 
+    # распознаём оба номера (контейнер и флекс)
     container_number = ocr_gpt_base64(img_b64, "container")
     flex_number = ocr_gpt_base64(img_b64, "flex")
 
-    folder = PHOTO_ROOT / user_state[uid]['booking']
-    save_photo(bytes_data, folder, f"{datetime.now().strftime('%H%M%S')}.jpg")
-    f_url = file_url(folder)
-
-    row = user_state[uid]['row']
+    row = state["row"]
+    # записываем то, что распознали (ссылки на папку сейчас НЕ пишем)
     if container_number != "НЕ УДАЛОСЬ":
-        update_sheet_cell(row, 6, container_number)  # F
-        update_sheet_cell(row, 8, f_url)             # H
+        update_sheet_cell(row, 6, container_number)  # F — номер контейнера
+        # update_sheet_cell(row, 8, f_url)           # H — ссылка на папку (отключено)
     if flex_number != "НЕ УДАЛОСЬ":
-        update_sheet_cell(row, 11, flex_number)      # K
-        update_sheet_cell(row, 13, f_url)            # M
+        update_sheet_cell(row, 11, flex_number)      # K — номер флекситанка
+        # update_sheet_cell(row, 13, f_url)          # M — ссылка на папку (отключено)
 
+    # Переходим к следующему шагу — ввод балок
     user_state[uid]["step"] = "beams"
     await update.message.reply_text("📸 Фото обработано. Сколько балок?")
+
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -185,8 +213,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
     logging.info("✅ Бот запущен")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
