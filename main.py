@@ -1,12 +1,11 @@
 import os
-import re
-import io
 import base64
 import logging
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 import json
+from typing import Dict
 
 from google.oauth2.service_account import Credentials
 import gspread
@@ -22,7 +21,7 @@ from telegram.ext import (
 import requests
 
 # ============================
-# LOAD ENV
+# ENV & CONFIG
 # ============================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,15 +29,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "FLEX")
 PHOTO_ROOT = Path("/tmp/flex_photos")  # не используется при отключённом сохранении
 
-# ============================
-# CONFIG
-# ============================
 logging.basicConfig(level=logging.INFO)
 
 # ============================
 # GOOGLE SHEETS
 # ============================
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive',
+]
 creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 client = gspread.authorize(creds)
@@ -46,25 +45,23 @@ ss = client.open(GOOGLE_SHEET_NAME)
 containers_ws = ss.sheet1
 
 # ============================
-# STATE
+# STATE (пошаговый ввод)
 # ============================
-# step: booking -> photo -> beams -> addons -> sheets
-user_state: dict[int, dict] = {}
+# chain: booking -> photo -> beams -> addons -> sheets
+user_state: Dict[int, Dict] = {}
 
 # ============================
-# OCR GPT (логика распознавания НЕ меняем)
+# OCR (сохраняем рабочую логику)
 # ============================
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 PROMPT_CONTAINER = (
-    "На фото контейнер или документ. Тебе нужно вернуть ТОЛЬКО номер контейнера "
-    "в формате ISO 6346: 4 буквы и 7 цифр (пример: MSKU1234567). "
-    "Если номера нет или он нечитаем, верни строго слово: НЕ УДАЛОСЬ."
+    "На фото контейнер или документ. Верни ТОЛЬКО номер контейнера в формате ISO 6346: "
+    "4 буквы + 7 цифр (пример: MSKU1234567). Если не найдено — верни: НЕ УДАЛОСЬ."
 )
 PROMPT_FLEX = (
-    "На фото этикетка флекси-танка. Номер ВСЕГДА начинается с B3G. Верни ТОЛЬКО серийный номер в формате: "
-    "B3G########X-25Q или B3G########X-26Q (пример: B3G24071283B-26Q). "
-    "Если номера нет или он нечитаем, верни строго: НЕ УДАЛОСЬ."
+    "На фото этикетка флекси-танка. Верни ТОЛЬКО номер в формате B3G########X-25Q/26Q "
+    "(пример: B3G24071283B-26Q). Если не найдено — верни: НЕ УДАЛОСЬ."
 )
 
 def ocr_gpt_base64(img_b64: str, mode: str) -> str:
@@ -85,17 +82,15 @@ def ocr_gpt_base64(img_b64: str, mode: str) -> str:
     try:
         r = requests.post(OPENAI_URL, headers=HEADERS, json=payload, timeout=60)
         r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip().upper()
+        return r.json()["choices"][0]["message"]["content"].strip().upper()
     except Exception as e:
-        logging.exception("OpenAI request failed: %s", e)
+        logging.exception("OpenAI OCR error: %s", e)
         return "НЕ УДАЛОСЬ"
 
 # ============================
 # HELPERS
 # ============================
-# Сохранение фото на диск временно ОТКЛЮЧЕНО по требованию.
-# Оставляем заглушки, чтобы код не падал и было проще вернуть функционал.
+# Сохранение фото отключено по требованию (оставляем заглушки).
 # def save_photo(photo_bytes: bytes, folder: Path, filename: str) -> str:
 #     folder.mkdir(parents=True, exist_ok=True)
 #     path = folder / filename
@@ -104,30 +99,32 @@ def ocr_gpt_base64(img_b64: str, mode: str) -> str:
 #     return str(path)
 
 # def file_url(path: Path) -> str:
-#     return f"file:///{str(path).replace('\\\', '/')}"
+#     return f"file:///{str(path).replace('\\\\', '/')}"
 
 def update_sheet_cell(row: int, col: int, value: str):
     try:
         containers_ws.update_cell(row, col, value)
     except Exception as e:
-        logging.exception("Google Sheets update failed (row=%s col=%s): %s", row, col, e)
+        logging.exception("Sheets update failed (row=%s col=%s): %s", row, col, e)
 
 # ============================
-# TELEGRAM BOT
+# HANDLERS
 # ============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("Начать ввод данных", callback_data="start_entry")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    uid = update.effective_user.id
+    user_state[uid] = {"step": "booking"}
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Начать ввод данных", callback_data="start_entry")]])
     await update.message.reply_text(
-        "Добро пожаловать! Нажмите кнопку ниже, чтобы начать.", reply_markup=reply_markup
+        "Добро пожаловать! Введите номер букинга (или нажмите кнопку ниже).",
+        reply_markup=kb,
     )
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
     user_state[uid] = {"step": "booking"}
-    await query.edit_message_text("Введите номер букинга:")
+    await q.edit_message_text("Введите номер букинга:")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -139,7 +136,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "booking":
         booking = text
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # создаём строку и запоминаем её индекс
         containers_ws.append_row([now, '', '', '', booking])  # E — букинг
         row = containers_ws.row_count
         update_sheet_cell(row, 18, uname)  # R — username
@@ -169,12 +165,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.isdigit():
             update_sheet_cell(state["row"], 16, text)  # P — Листы
             await update.message.reply_text("✅ Все данные сохранены.")
-            user_state.pop(uid, None)  # сброс состояния
+            user_state.pop(uid, None)
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
         return
 
-    await update.message.reply_text("Нажмите /start и следуйте инструкциям.")
+    await update.message.reply_text("Нажмите /start и следуйте шагам.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -183,39 +179,55 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала нажмите /start и введите букинг.")
         return
 
-    # берём фото максимального качества из массива
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     bytes_data = await file.download_as_bytearray()
     img_b64 = base64.b64encode(bytes_data).decode("utf-8")
 
-    # распознаём оба номера (контейнер и флекс)
     container_number = ocr_gpt_base64(img_b64, "container")
     flex_number = ocr_gpt_base64(img_b64, "flex")
 
     row = state["row"]
-    # записываем то, что распознали (ссылки на папку сейчас НЕ пишем)
     if container_number != "НЕ УДАЛОСЬ":
-        update_sheet_cell(row, 6, container_number)  # F — номер контейнера
-        # update_sheet_cell(row, 8, f_url)           # H — ссылка на папку (отключено)
+        update_sheet_cell(row, 6, container_number)  # F — контейнер
+        # update_sheet_cell(row, 8, f_url)          # H — ссылка на папку (отключено)
     if flex_number != "НЕ УДАЛОСЬ":
-        update_sheet_cell(row, 11, flex_number)      # K — номер флекситанка
+        update_sheet_cell(row, 11, flex_number)      # K — флекс
         # update_sheet_cell(row, 13, f_url)          # M — ссылка на папку (отключено)
 
-    # Переходим к следующему шагу — ввод балок
     user_state[uid]["step"] = "beams"
     await update.message.reply_text("📸 Фото обработано. Сколько балок?")
 
+# ============================
+# RUN (WEBHOOK for Render Web Service, fallback to polling)
+# ============================
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    logging.info("✅ Бот запущен")
-    app.run_polling()
+    logging.info("✅ Бот запускается в режиме webhook (Render Web Service)")
+    port = int(os.environ.get("PORT", 8443))
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+
+    if not host:
+        logging.warning("RENDER_EXTERNAL_HOSTNAME не задан — используем polling как фолбэк")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        return
+
+    webhook_url = f"https://{host}/{BOT_TOKEN}"
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=BOT_TOKEN,
+        webhook_url=webhook_url,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
