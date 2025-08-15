@@ -8,6 +8,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import json
 from typing import Dict
+import re
 
 from google.oauth2.service_account import Credentials
 import gspread
@@ -52,38 +53,67 @@ containers_ws = ss.sheet1
 user_state: Dict[int, Dict] = {}
 
 # ============================
-# OCR (сохраняем рабочую логику)
+# OCR (строгая валидация + повторная попытка)
 # ============================
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
 PROMPT_CONTAINER = (
-    "На фото контейнер или документ. Верни ТОЛЬКО номер контейнера в формате ISO 6346: "
-    "4 буквы + 7 цифр (пример: MSKU1234567). Если не найдено — верни: НЕ УДАЛОСЬ."
-)
-PROMPT_FLEX = (
-    "На фото этикетка флекси-танка. Верни ТОЛЬКО номер в формате B3G########X-25Q/26Q "
-    "(пример: B3G24071283B-26Q). Если не найдено — верни: НЕ УДАЛОСЬ."
+    "На фото контейнер или документ. Твоя задача — найти номер контейнера в формате ISO 6346. "
+    "Верни СТРОГО один токен, который соответствует regex: ^[A-Z]{4}[0-9]{7}$. "
+    "Если уверенности нет — верни ровно: НЕ УДАЛОСЬ."
 )
 
-def ocr_gpt_base64(img_b64: str, mode: str) -> str:
-    prompt = PROMPT_CONTAINER if mode == "container" else PROMPT_FLEX
+PROMPT_FLEX = (
+    "На фото этикетка флекси-танка. Ищи серийный номер, который ВСЕГДА начинается с B3G. "
+    "Верни СТРОГО один токен, соответствующий regex: ^B3G[0-9]{8,10}[A-Z]-2[56]Q$ . "
+    "Примеры: B3G24071283B-26Q, B3G24071254B-26Q. Если нет совпадения — верни: НЕ УДАЛОСЬ."
+)
+
+RE_CONTAINER = re.compile(r"^[A-Z]{4}[0-9]{7}$")
+RE_FLEX = re.compile(r"^B3G[0-9]{8,10}[A-Z]-2[56]Q$")
+
+
+def _is_valid(token: str, mode: str) -> bool:
+    t = (token or "").strip().upper()
+    return bool((RE_CONTAINER if mode == "container" else RE_FLEX).match(t))
+
+
+def _ask_ocr(img_b64: str, prompt_text: str) -> str:
     payload = {
         "model": "gpt-4o",
+        "temperature": 0,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                 ],
             }
         ],
-        "max_tokens": 50,
+        "max_tokens": 20,
     }
+    r = requests.post(OPENAI_URL, headers=HEADERS, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip().upper()
+
+
+def ocr_gpt_base64(img_b64: str, mode: str) -> str:
+    """Распознаём номер через GPT, затем валидируем по regex. Две попытки."""
     try:
-        r = requests.post(OPENAI_URL, headers=HEADERS, json=payload, timeout=60)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip().upper()
+        prompt = PROMPT_CONTAINER if mode == "container" else PROMPT_FLEX
+        out = _ask_ocr(img_b64, prompt)
+        if _is_valid(out, mode):
+            return out
+
+        followup = (
+            "Выведи ТОЛЬКО одно совпадение с regex: "
+            + ("^[A-Z]{4}[0-9]{7}$" if mode == "container" else "^B3G[0-9]{8,10}[A-Z]-2[56]Q$")
+            + ". Не добавляй комментарии. Если совпадения нет — верни: НЕ УДАЛОСЬ."
+        )
+        out2 = _ask_ocr(img_b64, followup)
+        return out2 if _is_valid(out2, mode) else "НЕ УДАЛОСЬ"
     except Exception as e:
         logging.exception("OpenAI OCR error: %s", e)
         return "НЕ УДАЛОСЬ"
@@ -91,11 +121,9 @@ def ocr_gpt_base64(img_b64: str, mode: str) -> str:
 # ============================
 # HELPERS
 # ============================
-# Сохранение фото отключено по требованию (оставляем заглушки).
-# def save_photo(photo_bytes: bytes, folder: Path, filename: str) -> str:
-#     ...
-# def file_url(path: Path) -> str:
-#     ...
+# Сохранение фото временно отключено по требованию (оставлены заглушки).
+# def save_photo(photo_bytes: bytes, folder: Path, filename: str) -> str: ...
+# def file_url(path: Path) -> str: ...
 
 def update_sheet_cell(row: int, col: int, value: str):
     try:
@@ -103,13 +131,20 @@ def update_sheet_cell(row: int, col: int, value: str):
     except Exception as e:
         logging.exception("Sheets update failed (row=%s col=%s): %s", row, col, e)
 
-# Утилита: получить индекс строки последнего добавления
-# (append_row сам не возвращает индекс; поэтому считаем до и после)
 
 def append_and_get_row(values: list) -> int:
-    pre = len(containers_ws.get_all_values())
-    containers_ws.append_row(values)
-    return pre + 1
+    containers_ws.append_row(values, value_input_option="USER_ENTERED")
+    # Возвращаем индекс последней занятой строки по колонке E (букинг)
+    return len(containers_ws.col_values(5))  # 5 = столбец E
+
+# ============================
+# UI helpers
+# ============================
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Начать", callback_data="start_entry")]]
+    )
 
 # ============================
 # HANDLERS
@@ -117,10 +152,9 @@ def append_and_get_row(values: list) -> int:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user_state[uid] = {"step": "booking"}
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Начать ввод данных", callback_data="start_entry")]])
     await update.message.reply_text(
         "Добро пожаловать! Введите номер букинга (или нажмите кнопку ниже).",
-        reply_markup=kb,
+        reply_markup=start_keyboard(),
     )
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -140,7 +174,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "booking":
         booking = text
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # корректно получаем индекс строки с новым букингом
         row = append_and_get_row([now, '', '', '', booking])  # E — букинг
         update_sheet_cell(row, 18, uname)  # R — username (установщик)
         user_state[uid] = {"row": row, "booking": booking, "step": "photo"}
@@ -168,30 +201,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "sheets":
         if text.isdigit():
             update_sheet_cell(state["row"], 16, text)  # P — Листы
-            await update.message.reply_text("✅ Все данные сохранены.")
             user_state.pop(uid, None)
+            await update.message.reply_text(
+                "✅ Все данные сохранены.", reply_markup=start_keyboard()
+            )
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
         return
 
-    await update.message.reply_text("Нажмите /start и следуйте шагам.")
+    # Если шаг не установлен — показываем кнопку Начать
+    await update.message.reply_text("Нажмите «Начать», чтобы пройти шаги.", reply_markup=start_keyboard())
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = user_state.get(uid)
 
-    # Если фото пришло альбомом (media group), не ругаемся на каждое фото
     mgid = getattr(update.message, "media_group_id", None)
     if state and mgid and mgid == state.get("last_mgid"):
-        # повторное фото из того же альбома — пропускаем молча
         return
 
     if not state or state.get("step") != "photo":
-        # Если уже прошли шаг фото — напомним, что ждём число балок
         if state and state.get("row"):
             await update.message.reply_text("Фото уже обработано. Сколько балок?")
             return
-        await update.message.reply_text("Сначала нажмите /start и введите букинг.")
+        await update.message.reply_text("Сначала нажмите «Начать» и введите букинг.", reply_markup=start_keyboard())
         return
 
     photo = update.message.photo[-1]
@@ -208,10 +241,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if flex_number != "НЕ УДАЛОСЬ":
         update_sheet_cell(row, 11, flex_number)      # K — флекс
 
-    # запоминаем обработанный альбом, чтобы не дублировать
     user_state[uid]["last_mgid"] = mgid
-
-    # Переходим к следующему шагу — ввод балок
     user_state[uid]["step"] = "beams"
     await update.message.reply_text("📸 Фото обработано. Сколько балок?")
 
@@ -227,7 +257,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # --- WEBHOOK-ONLY (без fallback на polling) ---
+    # --- WEBHOOK-ONLY ---
     port = int(os.environ.get("PORT", 8443))
     host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     if not host:
