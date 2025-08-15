@@ -1,7 +1,7 @@
 services:
-  - type: web
+  - type: worker
     name: flex-bot
     env: python
     plan: free
-    buildCommand: ""
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
