@@ -1,4 +1,4 @@
-# NOTE: Для Render Web Service требуется установить зависимость с вебхуками:
+# NOTE: Для Render Web Service нужна зависимость с вебхуками:
 # requirements.txt → python-telegram-bot[webhooks]==20.3
 
 import os
@@ -103,6 +103,14 @@ def update_sheet_cell(row: int, col: int, value: str):
     except Exception as e:
         logging.exception("Sheets update failed (row=%s col=%s): %s", row, col, e)
 
+# Утилита: получить индекс строки последнего добавления
+# (append_row сам не возвращает индекс; поэтому считаем до и после)
+
+def append_and_get_row(values: list) -> int:
+    pre = len(containers_ws.get_all_values())
+    containers_ws.append_row(values)
+    return pre + 1
+
 # ============================
 # HANDLERS
 # ============================
@@ -132,9 +140,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "booking":
         booking = text
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        containers_ws.append_row([now, '', '', '', booking])  # E — букинг
-        row = containers_ws.row_count
-        update_sheet_cell(row, 18, uname)  # R — username
+        # корректно получаем индекс строки с новым букингом
+        row = append_and_get_row([now, '', '', '', booking])  # E — букинг
+        update_sheet_cell(row, 18, uname)  # R — username (установщик)
         user_state[uid] = {"row": row, "booking": booking, "step": "photo"}
         await update.message.reply_text("📌 Букинг сохранён. Теперь загрузите фото контейнера и флекса.")
         return
@@ -171,7 +179,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = user_state.get(uid)
+
+    # Если фото пришло альбомом (media group), не ругаемся на каждое фото
+    mgid = getattr(update.message, "media_group_id", None)
+    if state and mgid and mgid == state.get("last_mgid"):
+        # повторное фото из того же альбома — пропускаем молча
+        return
+
     if not state or state.get("step") != "photo":
+        # Если уже прошли шаг фото — напомним, что ждём число балок
+        if state and state.get("row"):
+            await update.message.reply_text("Фото уже обработано. Сколько балок?")
+            return
         await update.message.reply_text("Сначала нажмите /start и введите букинг.")
         return
 
@@ -189,6 +208,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if flex_number != "НЕ УДАЛОСЬ":
         update_sheet_cell(row, 11, flex_number)      # K — флекс
 
+    # запоминаем обработанный альбом, чтобы не дублировать
+    user_state[uid]["last_mgid"] = mgid
+
+    # Переходим к следующему шагу — ввод балок
     user_state[uid]["step"] = "beams"
     await update.message.reply_text("📸 Фото обработано. Сколько балок?")
 
