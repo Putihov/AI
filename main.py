@@ -202,6 +202,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RUN (WEBHOOK for Render Web Service, fallback to polling)
 # ============================
 
+# ============================
+# RUN (WEBHOOK-ONLY for Render Web Service)
+# ============================
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -210,16 +214,17 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    logging.info("✅ Бот запускается в режиме webhook (Render Web Service)")
+    # --- WEBHOOK-ONLY (без fallback на polling) ---
     port = int(os.environ.get("PORT", 8443))
     host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-
     if not host:
-        logging.warning("RENDER_EXTERNAL_HOSTNAME не задан — используем polling как фолбэк")
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-        return
+        raise RuntimeError(
+            "RENDER_EXTERNAL_HOSTNAME не задан. Запускайте как Render Web Service или укажите переменную окружения."
+        )
 
     webhook_url = f"https://{host}/{BOT_TOKEN}"
+    logging.info(f"✅ Запускаем webhook на {webhook_url}, порт={port}")
+
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
@@ -229,6 +234,8 @@ def main():
         drop_pending_updates=True,
     )
 
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
