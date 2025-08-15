@@ -10,12 +10,13 @@ import json
 from typing import Dict
 import re
 import requests
+
 from google.oauth2.service_account import Credentials
 import gspread
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
@@ -42,8 +43,8 @@ logging.basicConfig(level=logging.INFO)
 # GOOGLE SHEETS
 # ============================
 SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive',
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
@@ -52,76 +53,123 @@ ss = client.open(GOOGLE_SHEET_NAME)
 containers_ws = ss.sheet1
 
 # ============================
-# STATE
+# STATE (пошаговый ввод)
 # ============================
+# chain: booking -> photo -> beams -> addons -> sheets
 user_state: Dict[int, Dict] = {}
 
 # ============================
-# OCR via GPT-5o → fallback GPT-4o
+# OCR (VISION): используем только поддерживаемые модели
+#   Основная: gpt-4o  (поддерживает изображения)
+#   Fallback: gpt-4.1  (как текстовый пост-проход, может вернуть кандидаты)
 # ============================
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 RE_CONTAINER = re.compile(r"^[A-Z]{4}[0-9]{7}$")
 RE_FLEX = re.compile(r"^B3G[0-9]{8,10}[A-Z]-2[56]Q$")
 
-def ocr_gpt_base64(img_b64: str, mode: str) -> str:
-    models = ["gpt-5o", "gpt-4o"]
-    prompt = (
-        "Извлеки номер контейнера формата ISO 6346" if mode == "container" else
-        "Извлеки серийный номер флекситанка, начинающийся с B3G"
-    )
 
-    for model in models:
-        try:
+def _extract_match(text: str, mode: str) -> str | None:
+    text = (text or "").upper()
+    regex = RE_CONTAINER if mode == "container" else RE_FLEX
+    m = regex.search(text)
+    return m.group(0) if m else None
+
+
+def ocr_gpt_base64(img_b64: str, mode: str) -> str:
+    """Распознаём номер через gpt-4o. Если не найден — пробуем второй запрос с жёстким regex."""
+    try:
+        base_prompt = (
+            "На фото контейнер. Найди номер ISO 6346. Верни только номер." if mode == "container" else
+            "На фото этикетка флекси‑танка. Номер начинается с B3G и заканчивается -25Q или -26Q. Верни только номер."
+        )
+
+        def ask(prompt_text: str) -> str:
             payload = {
-                "model": model,
+                "model": "gpt-4o",
+                "temperature": 0,
                 "messages": [
-                    {"role": "system", "content": "Ты — OCR-система. Отвечай только найденным номером."},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                    ]}
+                    {"role": "system", "content": "Ты — OCR-система. Отвечай ТОЛЬКО найденным номером, без комментариев."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                        ],
+                    },
                 ],
                 "max_tokens": 30,
             }
-            r = requests.post(OPENAI_URL, headers=HEADERS, json=payload, timeout=60)
+            r = requests.post(OPENAI_CHAT_URL, headers=HEADERS, json=payload, timeout=60)
             r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"].strip().upper()
-            regex = RE_CONTAINER if mode == "container" else RE_FLEX
-            m = regex.search(text)
-            if m:
-                return m.group(0)
-        except Exception as e:
-            logging.error(f"OCR error on {model}: {e}")
+            return r.json()["choices"][0]["message"]["content"].strip()
+
+        # Первая попытка — базовый промпт
+        out1 = ask(base_prompt)
+        token = _extract_match(out1, mode)
+        if token:
+            return token
+
+        # Вторая попытка — строго просим один матч по regex
+        strict_regex = "^[A-Z]{4}[0-9]{7}$" if mode == "container" else "^B3G[0-9]{8,10}[A-Z]-2[56]Q$"
+        out2 = ask(f"Найди и выведи ОДИН номер, соответствующий regex: {strict_regex}. Никаких пояснений.")
+        token = _extract_match(out2, mode)
+        if token:
+            return token
+
+    except Exception as e:
+        logging.exception("OpenAI OCR error: %s", e)
+
     return "НЕ УДАЛОСЬ"
 
 # ============================
 # HELPERS
 # ============================
+# Сохранение фото отключено (по ТЗ), работаем только с OCR и ссылками на фото позже.
+
 def update_sheet_cell(row: int, col: int, value: str):
     try:
         containers_ws.update_cell(row, col, value)
     except Exception as e:
         logging.exception("Sheets update failed (row=%s col=%s): %s", row, col, e)
 
+
 def append_and_get_row(values: list) -> int:
     containers_ws.append_row(values, value_input_option="USER_ENTERED")
+    # индекс рассчитываем по длине колонки E (букинг)
     return len(containers_ws.col_values(5))
 
+# ============================
+# UI helpers
+# ============================
+
+def inline_start_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Начать", callback_data="start_entry")]])
+
+
 def reply_start_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[KeyboardButton("Начать")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([[KeyboardButton("Начать")]], resize_keyboard=True, one_time_keyboard=False)
 
 # ============================
 # HANDLERS
 # ============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user_state[uid] = {"step": "booking"}
+    user_state[uid] = {"step": "booking", "have_container": False, "have_flex": False}
     await update.message.reply_text(
-        "Добро пожаловать! Введите номер букинга.",
+        "Введите номер букинга (или нажмите кнопку внизу).",
         reply_markup=reply_start_kb(),
     )
+
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user_state[uid] = {"step": "booking", "have_container": False, "have_flex": False}
+    await q.edit_message_text("Введите номер букинга:")
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -130,53 +178,58 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_state.get(uid, {})
     step = state.get("step")
 
-    if text.lower() == "начать":
-        user_state[uid] = {"step": "booking"}
+    # Кнопка «Начать» из нижнего меню
+    if re.fullmatch(r"начать", text, flags=re.IGNORECASE):
+        user_state[uid] = {"step": "booking", "have_container": False, "have_flex": False}
         await update.message.reply_text("Введите номер букинга:")
         return
 
     if step == "booking":
         booking = text
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        row = append_and_get_row([now, '', '', '', booking])
-        update_sheet_cell(row, 18, uname)
-        user_state[uid] = {"row": row, "booking": booking, "step": "photo"}
-        await update.message.reply_text("📌 Букинг сохранён. Теперь загрузите фото контейнера и флекса.")
+        row = append_and_get_row([now, '', '', '', booking])  # Запись в E — букинг
+        update_sheet_cell(row, 18, uname)  # R — логин установщика
+        user_state[uid] = {"row": row, "booking": booking, "step": "photo", "have_container": False, "have_flex": False}
+        await update.message.reply_text("📌 Букинг сохранён. Теперь загрузите фото контейнера и флекса (можно одним альбомом).")
         return
 
     if step == "beams":
         if text.isdigit():
-            update_sheet_cell(state["row"], 14, text)
+            update_sheet_cell(state["row"], 14, text)  # N — Балки
             user_state[uid]["step"] = "addons"
-            await update.message.reply_text("📌 Сколько дополнительных?")
+            await update.message.reply_text("📌 Сколько дополнительных? Введите число:")
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
         return
 
     if step == "addons":
         if text.isdigit():
-            update_sheet_cell(state["row"], 15, text)
+            update_sheet_cell(state["row"], 15, text)  # O — Допы
             user_state[uid]["step"] = "sheets"
-            await update.message.reply_text("📌 Сколько листов?")
+            await update.message.reply_text("📌 Сколько листов? Введите число:")
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
         return
 
     if step == "sheets":
         if text.isdigit():
-            update_sheet_cell(state["row"], 16, text)
+            update_sheet_cell(state["row"], 16, text)  # P — Листы
             user_state.pop(uid, None)
             await update.message.reply_text("✅ Все данные сохранены.", reply_markup=reply_start_kb())
         else:
             await update.message.reply_text("⚠ Нужно ввести число.")
         return
 
-    await update.message.reply_text("Нажмите «Начать», чтобы пройти шаги.", reply_markup=reply_start_kb())
+    # fallback
+    await update.message.reply_text("Нажмите «Начать», чтобы начать ввод.", reply_markup=reply_start_kb())
+
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = user_state.get(uid)
-    if not state or state.get("step") != "photo":
+
+    # Принимаем фото на шагах photo ИЛИ beams (чтобы не мешал альбом)
+    if not state or state.get("step") not in {"photo", "beams"}:
         await update.message.reply_text("Сначала нажмите «Начать» и введите букинг.", reply_markup=reply_start_kb())
         return
 
@@ -185,33 +238,47 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bytes_data = await file.download_as_bytearray()
     img_b64 = base64.b64encode(bytes_data).decode("utf-8")
 
-    container_number = ocr_gpt_base64(img_b64, "container")
-    flex_number = ocr_gpt_base64(img_b64, "flex")
+    # Пробуем достать оба номера с каждого фото. Записываем только если ещё не записано.
+    row = state.get("row")
+    if row:
+        cont = ocr_gpt_base64(img_b64, "container")
+        flex = ocr_gpt_base64(img_b64, "flex")
+        if cont != "НЕ УДАЛОСЬ" and not state.get("have_container"):
+            update_sheet_cell(row, 6, cont)
+            state["have_container"] = True
+        if flex != "НЕ УДАЛОСЬ" and not state.get("have_flex"):
+            update_sheet_cell(row, 11, flex)
+            state["have_flex"] = True
 
-    row = state["row"]
-    if container_number != "НЕ УДАЛОСЬ":
-        update_sheet_cell(row, 6, container_number)
-    if flex_number != "НЕ УДАЛОСЬ":
-        update_sheet_cell(row, 11, flex_number)
-
-    user_state[uid]["step"] = "beams"
-    await update.message.reply_text("📸 Фото обработано. Сколько балок?")
+    # После первого фото переводим на шаг beams, но продолжаем принимать фото без ошибок
+    if state.get("step") == "photo":
+        state["step"] = "beams"
+        await update.message.reply_text("📸 Фото обработано. Сколько балок?")
+    else:
+        # Если пользователь прислал ещё одно фото уже на шаге "beams" — молча пытаемся дополнить номера.
+        pass
 
 # ============================
-# RUN WEBHOOK
+# RUN (WEBHOOK-ONLY for Render Web Service)
 # ============================
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^начать$"), handle_text))
+    app.add_handler(CallbackQueryHandler(handle_button))
+    # Исправление "global flags not at the start": используем компилированный regex с IGNORECASE
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r"^начать$", re.IGNORECASE)), handle_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
+    # --- WEBHOOK-ONLY ---
     port = int(os.environ.get("PORT", 8443))
     host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     if not host:
-        raise RuntimeError("RENDER_EXTERNAL_HOSTNAME не задан")
+        raise RuntimeError(
+            "RENDER_EXTERNAL_HOSTNAME не задан. Запускайте как Render Web Service или укажите переменную окружения."
+        )
 
     webhook_url = f"https://{host}/{BOT_TOKEN}"
     logging.info(f"✅ Запускаем webhook на {webhook_url}, порт={port}")
@@ -224,6 +291,7 @@ def main():
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
+
 
 if __name__ == "__main__":
     main()
