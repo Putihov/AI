@@ -1,8 +1,10 @@
+# NOTE: Для Render Web Service требуется установить зависимость с вебхуками:
+# requirements.txt → python-telegram-bot[webhooks]==20.3
+
 import os
 import base64
 import logging
 from datetime import datetime
-from pathlib import Path
 from dotenv import load_dotenv
 import json
 from typing import Dict
@@ -27,7 +29,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "FLEX")
-PHOTO_ROOT = Path("/tmp/flex_photos")  # не используется при отключённом сохранении
 
 logging.basicConfig(level=logging.INFO)
 
@@ -92,14 +93,9 @@ def ocr_gpt_base64(img_b64: str, mode: str) -> str:
 # ============================
 # Сохранение фото отключено по требованию (оставляем заглушки).
 # def save_photo(photo_bytes: bytes, folder: Path, filename: str) -> str:
-#     folder.mkdir(parents=True, exist_ok=True)
-#     path = folder / filename
-#     with open(path, "wb") as f:
-#         f.write(photo_bytes)
-#     return str(path)
-
+#     ...
 # def file_url(path: Path) -> str:
-#     return f"file:///{str(path).replace('\\\\', '/')}"
+#     ...
 
 def update_sheet_cell(row: int, col: int, value: str):
     try:
@@ -190,17 +186,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = state["row"]
     if container_number != "НЕ УДАЛОСЬ":
         update_sheet_cell(row, 6, container_number)  # F — контейнер
-        # update_sheet_cell(row, 8, f_url)          # H — ссылка на папку (отключено)
     if flex_number != "НЕ УДАЛОСЬ":
         update_sheet_cell(row, 11, flex_number)      # K — флекс
-        # update_sheet_cell(row, 13, f_url)          # M — ссылка на папку (отключено)
 
     user_state[uid]["step"] = "beams"
     await update.message.reply_text("📸 Фото обработано. Сколько балок?")
-
-# ============================
-# RUN (WEBHOOK for Render Web Service, fallback to polling)
-# ============================
 
 # ============================
 # RUN (WEBHOOK-ONLY for Render Web Service)
@@ -234,8 +224,6 @@ def main():
         drop_pending_updates=True,
     )
 
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
